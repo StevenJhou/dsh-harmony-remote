@@ -1,0 +1,15 @@
+# dependencies
+node_modules/
+
+# local runtime / logs
+*.log
+*.bak
+*.bak-*
+
+# local config with secrets — NEVER commit a real token
+.env
+.env.*
+cordis.patch.yml.bak*
+
+# local test artifacts
+test-output/

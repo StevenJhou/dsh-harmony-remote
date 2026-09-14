@@ -1,0 +1,16 @@
+# Patch layer contributed by the dsh-harmony-remote bundle.
+# It is applied when this package is listed in the profile's
+# `dsh.profile.bundles`, or when the same `insert` block is appended to
+# $DSH_HOME/profiles/<profile>/cordis.patch.yml by hand.
+- insert:
+    - id: harmony-remote
+      name: 'dsh-harmony-remote'
+      config:
+        # Local-only REST bridge. 127.0.0.1 is deliberate: this API can drive
+        # the agent and read every transcript, so it must never bind a public
+        # interface unless you also set `token` and understand the risk.
+        host: '127.0.0.1'
+        port: 3100
+        # When set, every request must carry `X-DSH-Token: <token>`.
+        # Leave empty to disable the check on loopback.
+        token: ''

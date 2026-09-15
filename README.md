@@ -131,6 +131,29 @@ ctx.apiProxy.sessions.list | create | history | models | selectModel | prompt | 
 > Body: `{ "sessionId"? }`
 → `{ ok, sessionId, cancelled: true }`
 
+### `GET /events` — 确认事件长轮询（confirm 多端同步）
+
+> 用于**多端同步确认问答**：手机端轮询这个接口，就能收到和电脑端同时弹的确认对话框。
+> English: Long-poll for confirmation requests. A phone polls this to receive the same dialogs the desktop shows.
+> Query: `since`（游标，首次传 `0` / cursor, `0` on first call）
+> 单次最长挂起 25 秒；有事件到达立即返回。Holds the request up to 25 s; returns immediately when an event arrives.
+→ `{ ok, cursor, events:[{ cursor, type:'confirm_request'|'confirm_resolved', id, kind:'approval'|'question', payload }] }`
+
+* `kind: 'approval'`（审批）的 `payload`: `{ toolName, reason, sessionId }`
+* `kind: 'question'`（提问）的 `payload`: `{ sessionId, questions:[{ id, header, question, options?, multiSelect?, detail? }] }`
+
+> 说明：`multiSelect` 和 `detail` 必须随问题一起发出，否则客户端无法知道该问题可多选、也无法展示 `plan-review` 类问题要看的方案详情。**`confirm_request` 只在请求仍「待处理」时返回**；一旦已被回答/撤销/过期，就从流里消失（其 `confirm_resolved` 回执仍在）。这样从 `since=0` 开始轮询的客户端不会重放历史积压、弹一堆已失效的框。
+
+### `POST /confirm` — 提交手机端确认结果
+
+> 手机端对镜像的确认框作答后回传，让 DSH 继续执行。
+> English: Answer a mirrored confirmation from the phone.
+> Body: `{ "id": "cf-…", "answer": … }`
+> 其中 `answer` 对于审批(approval)是 `{ outcome }`（取 `allowed-once` | `rejected` | `cancelled`）；
+> 对于提问(question)是 `{ answers:[{ id, selected:[…], custom? }] }`。
+→ `{ ok, id }`
+错误 / Errors: `400 bad-request`, `404 unknown-confirm`（已过期或从未发出）, `409 already-resolved`（已被另一端答过）
+
 ### `GET /tools` — 已注册工具列表
 
 > 返回当前注册的工具名。
@@ -139,6 +162,33 @@ ctx.apiProxy.sessions.list | create | history | models | selectModel | prompt | 
 ### `GET /` — 根路径
 
 > 是 `/health` 的别名（Alias of `/health`）。
+
+## 确认问答镜像 / Approval & question mirroring
+
+> 中文：DSH 的两套「问人」机制——**审批（approval）**和**提问（ask_user_question）**——会被**镜像**到手机端；电脑端的原生对话框仍然保留，**谁先回答谁生效**。
+>
+> English: DSH's two "ask a human" paths are mirrored to the phone; the desktop dialog stays up and the first answer wins.
+
+两者都通过 `ctx.effect` 安装，**卸载插件即恢复原状**。
+
+* **审批 Approval**：监听 `approval/request` waterfall，挂在 Web UI 自己的监听器**外层（prepend）**。只接受 `allowed-once` / `rejected` / `cancelled`，其余一律丢弃并让原生对话框决定。**沙箱语义不变——绝不会放宽一个 deny。**
+* **提问 Question**：`userQuestions.ask` 被包裹（第二次 `registerProvider` 会抛 `DUPLICATE_PROVIDER`，所以只能包裹不可重复注册）。包裹器必须解析成 `{ answers: [...] }`，因为 `dsh-tool-ask-user` 读的是 `(await ask(...)).answers`；每条需要 `id`（不是 `questionId`）和 `selected`。`normalizeAnswers()` 会强制这两点，同时为旧版 App 兼容 `questionId`。
+
+两个关键常量 / two constants:
+
+| constant | value | 含义 / meaning |
+| --- | --- | --- |
+| `EVENT_HOLD_MS` | 25 s | 一次 `GET /events` 最多挂起多久（须小于客户端 30s 读超时） |
+| `ANSWER_TIMEOUT_MS` | 5 min | 人类有多长作答时间，超时该待处理的记录会被丢弃 |
+
+> 谁先答谁赢，输的一侧请求被**撤销（withdrawn）**：事后补点会收到 `409 already-resolved`，而不是「看似成功实则没生效」。**手机端对话框被关闭时什么都不发**——回 `cancelled` 会真的取消一个审批，而不是让电脑端继续处理。
+>
+> **手机端作答后，电脑端对话框会关闭。** Web UI 依赖 `question/resolved` / `approval/resolved` 的 mux 帧来停止等待，而宿主侧唯一能触发这些的是 apiproxy 在请求 signal 上注册的中止监听器。所以桥会**给原生路径一个自己的 signal**（`desktopOnlySignal()`），当手机端答案胜出后把它 abort：
+> * 调用方的 signal **从不**被 abort（否则 `dsh-user-approval` 会把结果竞态成 `'cancelled'`，用户的允许会悄悄变成取消）
+> * abort 发生在 `Promise.race` 落定**之后**（提前 abort 会让下游的 `'cancelled'` / `ASK_ABORTED` 先到并胜出）
+> * 提问会复制一份 request（`{...request, signal}`）；审批不能，因为 cordis 的 waterfall `next()` 不带参数，只能原地替换 `req.signal`。运行时唯一在 `approval/request` 上的监听器是 apiproxy 的，且 `dsh-user-approval` 进入 waterfall 前已捕获了原始 signal，所以影响范围正好是电脑端那个对话框。
+>
+> 审批桥**必须以 `{ prepend: true }` 注册**：cordis 把 waterfall 当链派发，apiproxy 的监听器一旦匹配某个审批就返回自己的 promise 且不调用 `next()`；本插件是后插入的，如果正常注册会**排到 apiproxy 后面永远不执行**，那样审批就永远不会到达手机端。
 
 ## 会话定位 / Session targeting
 

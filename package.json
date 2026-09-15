@@ -1,6 +1,6 @@
 {
   "name": "dsh-harmony-remote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Local REST bridge that lets a HarmonyOS app remote-control DeepSeek Harness: read status, switch model, send prompts, read replies, list sessions, cancel a running turn.",
   "type": "module",
   "license": "MIT",

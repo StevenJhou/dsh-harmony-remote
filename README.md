@@ -1,11 +1,5 @@
 # dsh-harmony-remote
 
-> **⚠️ 重要提示 / Important**
->
-> **本插件本身没有界面，它只是一个「后端桥」。必须配套一个鸿蒙遥控器前端 App（或任何能调用下面这些 REST 接口的客户端）才有实际用途——单独这一个后端，没人调它的接口，是无用的。**
->
-> **This plugin alone has NO user interface — it is only a backend bridge. It becomes useful only when a front-end client (the HarmonyOS remote-control app, a browser page, or a curl script) actually calls its REST endpoints. A backend with no caller does nothing on its own.**
-
 A local REST bridge that lets a **HarmonyOS phone app remote-control this DeepSeek Harness process** —
 the same way the dsh web UI does.
 
@@ -120,6 +114,30 @@ Stop the running turn, keeping queued work (`keepInbox`).
 Body: `{ "sessionId"? }`
 → `{ ok, sessionId, cancelled: true }`
 
+### `GET /events`
+Long poll for confirmation requests. Query: `since` (cursor, `0` on first call).
+Holds the request up to 25 s; returns immediately when an event arrives.
+→ `{ ok, cursor, events:[{ cursor, type:'confirm_request'|'confirm_resolved', id, kind:'approval'|'question', payload }] }`
+
+`payload` for `kind:'approval'` is `{ toolName, reason, sessionId }`;
+for `kind:'question'` it is `{ sessionId, questions:[{ id, header, question, options?, multiSelect?, detail? }] }`.
+
+`multiSelect` and `detail` must travel with the question. Without them a client cannot know that a
+question accepts several answers, nor show the plan a `plan-review` question is asking about — so it
+degrades to "tap one option and it is submitted", with no way to change your mind.
+
+**A `confirm_request` is only returned while it is still pending.** Once it is answered, withdrawn,
+or expired it disappears from the stream (its `confirm_resolved` receipt stays). Without that filter
+a client starting at `since=0` replays the whole backlog and pops dialogs for requests that no longer
+exist — tapping one can only ever fail with `404 unknown-confirm`.
+
+### `POST /confirm`
+Answer a mirrored confirmation from the phone.
+Body: `{ "id": "cf-…", "answer": … }` where `answer` is `{ outcome }` for approvals
+(`allowed-once` | `rejected` | `cancelled`) or `{ answers:[{ id, selected:[…], custom? }] }` for questions.
+→ `{ ok, id }`
+Errors: `400 bad-request`, `404 unknown-confirm` (expired or never issued), `409 already-resolved`.
+
 ### `GET /tools`
 Names of tools currently registered.
 → `{ ok, count, tools:[…] }`
@@ -138,6 +156,50 @@ An explicit `sessionId` always wins. Otherwise a session is inferred **only when
 That conservatism is deliberate: a remote `send` that silently landed in the wrong conversation
 would be worse than an error. `GET /status` lists every candidate under `liveAgents`, so the phone
 app can offer a picker.
+
+## Approval / question mirroring
+
+DSH's two "ask a human" paths are mirrored to the phone; the desktop dialog stays up and the first
+answer wins. Both are installed from `ctx.effect`, so unloading the plugin restores the originals.
+
+* **Approval** — a listener on the `approval/request` waterfall, wrapped *outside* the web UI's own
+  listener. Only `allowed-once` / `rejected` / `cancelled` are accepted; anything else is discarded
+  and the native dialog decides. Sandbox semantics are untouched: this can never widen a deny.
+* **Questions** — `userQuestions.ask` is wrapped (a second `registerProvider` would throw
+  `DUPLICATE_PROVIDER`). The wrapper must resolve to **`{ answers: [...] }`**, because
+  `dsh-tool-ask-user` reads `(await ask(...)).answers`; each item needs `id` (not `questionId`) and
+  `selected`. `normalizeAnswers()` enforces both, accepting `questionId` for older app builds.
+
+Two constants matter and must not be conflated:
+
+| constant | value | meaning |
+| --- | --- | --- |
+| `EVENT_HOLD_MS` | 25 s | how long one `GET /events` request may hang (keep it under the client's 30 s read timeout) |
+| `ANSWER_TIMEOUT_MS` | 5 min | how long a human has to answer before the pending record is discarded |
+
+Whoever answers first wins, and the loser's request is **withdrawn**: a late tap on the losing side
+gets `409 already-resolved` instead of a success that quietly did nothing. Dismissing the phone
+dialog sends **nothing** — replying `cancelled` would genuinely cancel an approval instead of
+deferring to the desktop.
+
+**The desktop dialog closes when the phone answers.** The web UI drops its wait on a
+`question/resolved` / `approval/resolved` mux frame, and the only host-side trigger for those is the
+abort listener apiproxy registers on the request's signal. So the bridge hands the native path a
+signal of its own (`desktopOnlySignal()`) and aborts it once the phone's answer has won:
+
+* The **caller's** signal is never aborted. Aborting it would make `dsh-user-approval` race its own
+  outcome to `'cancelled'` — the user's "allow once" would silently become a cancellation.
+* The abort happens **after** `Promise.race` settles. Aborting earlier lets the downstream
+  settlement (approval `'cancelled'` / question `ASK_ABORTED`) reach the race first and win.
+* Questions take a copy of the request (`{...request, signal}`); approvals cannot, because cordis's
+  waterfall `next()` takes no arguments — there `req.signal` is replaced in place. The only runtime
+  listener on `approval/request` is apiproxy's, and `dsh-user-approval` captured the original signal
+  before entering the waterfall, so the blast radius is exactly the desktop dialog.
+
+The approval bridge **must** register with `{ prepend: true }`. cordis dispatches waterfalls as a
+chain: apiproxy's listener returns its own promise without calling `next()` whenever it matches an
+approval, and this plugin is inserted after every bundle — registered normally it would sit *behind*
+apiproxy and never run at all, so no approval would ever reach the phone.
 
 ## Security
 
